@@ -194,6 +194,7 @@ app.layout = html.Div(
     style={"display": "flex", "alignItems": "flex-start", "columnGap": "8px"},
     children=[
         dcc.Store(id="browser-data", data=CLIENT_DATA),
+        dcc.Store(id="bad-channels", data=CLIENT_DATA["bads"]),
         html.Div(
             children=[
                 dcc.Slider(
@@ -226,7 +227,44 @@ app.layout = html.Div(
 
 app.clientside_callback(
     """
-    function(sliderVal, fig, browserData) {
+    function(clickData, fig, badChannels) {
+        const noUpdate = window.dash_clientside.no_update;
+        if (!clickData || !clickData.points || clickData.points.length === 0 || !fig || !fig.data) {
+            return noUpdate;
+        }
+
+        const point = clickData.points[0];
+        const curveNumber = point.curveNumber;
+        if (curveNumber === undefined || curveNumber === null) {
+            return noUpdate;
+        }
+
+        const trace = fig.data[curveNumber];
+        if (!trace || !trace.name) {
+            return noUpdate;
+        }
+
+        const next = Array.isArray(badChannels) ? [...badChannels] : [];
+        const idx = next.indexOf(trace.name);
+        if (idx >= 0) {
+            next.splice(idx, 1);
+        } else {
+            next.push(trace.name);
+        }
+        return next;
+    }
+    """,
+    Output("bad-channels", "data"),
+    Input("browser", "clickData"),
+    State("browser", "figure"),
+    State("bad-channels", "data"),
+    prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """
+    function(sliderVal, badChannels, fig, browserData) {
         if (!fig || !browserData) {
             return fig;
         }
@@ -234,7 +272,9 @@ app.clientside_callback(
         const nChannels = browserData.n_channels;
         const allData = browserData.all_data_scaled;
         const chNames = browserData.ch_names;
-        const bads = new Set(browserData.bads || []);
+        const bads = new Set(
+            Array.isArray(badChannels) ? badChannels : (browserData.bads || [])
+        );
 
         const maxStart = Math.max(0, chNames.length - nChannels);
         const channelStart = Math.max(0, Math.min(sliderVal || 0, maxStart));
@@ -293,6 +333,7 @@ app.clientside_callback(
     """,
     Output("browser", "figure"),
     Input("channel-slider", "value"),
+    Input("bad-channels", "data"),
     State("browser", "figure"),
     State("browser-data", "data"),
 )
