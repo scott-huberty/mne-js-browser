@@ -3,7 +3,7 @@ import mne
 import plotly.graph_objects as go
 
 import dash
-from dash import dcc, html, Input, Output, Patch
+from dash import dcc, html, Input, Output, State
 
 
 data_path = mne.datasets.sample.data_path()
@@ -29,15 +29,22 @@ FULL_TMIN = float(raw.times[0])
 FULL_TMAX = float(raw.times[-1])
 TIMES = raw.times.copy()
 
-# Pre-extract all EEG data once so slider callbacks only slice numpy arrays.
+# Pre-extract all EEG data once and send to browser for client-side channel updates.
 # Shape: (n_eeg_channels, n_times)
 ALL_DATA = raw.get_data(picks=picks)
 ALL_DATA_SCALED = ALL_DATA * 1e4  # visual scaling for stacked display
-# ALL_DATA_UV = ALL_DATA * 1e6  # for hover text
 
 BADS = set(raw.info["bads"])
 ALL_CH_NAMES = [raw.info["ch_names"][p] for p in picks]
 MAX_SLIDER_VALUE = max(0, len(picks) - N_CHANNELS)
+
+CLIENT_DATA = {
+    "times": TIMES.tolist(),
+    "all_data_scaled": ALL_DATA_SCALED.tolist(),
+    "ch_names": ALL_CH_NAMES,
+    "bads": sorted(BADS),
+    "n_channels": N_CHANNELS,
+}
 
 
 def _annotation_overlays():
@@ -124,14 +131,14 @@ def make_base_figure(channel_start=0, n_channels=N_CHANNELS, x_range=(0, 10)):
                 x=TIMES,
                 y=y,
                 name=ch_name,
-                #text=np.round(ALL_DATA_UV[ii], 3),
                 mode="lines",
+                text=ALL_DATA[ii],
                 line=dict(color=color, width=1),
                 showlegend=False,
                 hovertemplate=(
                     f"<b>Channel:</b> {ch_name}<br>"
                     "<b>Time:</b> %{x:.2f} s<br>"
-                   #"<b>Amplitude:</b> %{text:.2f} μV<br>"
+                    "<b>Amplitude:</b> %{text:.7f} V<br>"
                     "<extra></extra>"
                 ),
             )
@@ -172,7 +179,7 @@ def make_base_figure(channel_start=0, n_channels=N_CHANNELS, x_range=(0, 10)):
         ),
         shapes=STATIC_SHAPES,
         annotations=STATIC_ANNOTATIONS,
-        # Helps Plotly preserve client-side UI state across server updates
+        # Helps Plotly preserve client-side UI state across updates
         uirevision="browser",
     )
     return fig
@@ -186,6 +193,7 @@ app = dash.Dash(__name__)
 app.layout = html.Div(
     style={"display": "flex", "alignItems": "flex-start", "columnGap": "8px"},
     children=[
+        dcc.Store(id="browser-data", data=CLIENT_DATA),
         html.Div(
             children=[
                 dcc.Slider(
@@ -216,48 +224,78 @@ app.layout = html.Div(
 )
 
 
-@app.callback(
+app.clientside_callback(
+    """
+    function(sliderVal, fig, browserData) {
+        if (!fig || !browserData) {
+            return fig;
+        }
+
+        const nChannels = browserData.n_channels;
+        const allData = browserData.all_data_scaled;
+        const chNames = browserData.ch_names;
+        const bads = new Set(browserData.bads || []);
+
+        const maxStart = Math.max(0, chNames.length - nChannels);
+        const channelStart = Math.max(0, Math.min(sliderVal || 0, maxStart));
+
+        const outFig = {
+            ...fig,
+            data: (fig.data || []).map((trace) => ({
+                ...trace,
+                line: { ...(trace.line || {}) },
+            })),
+            layout: {
+                ...fig.layout,
+                yaxis: { ...(fig.layout?.yaxis || {}) },
+            },
+        };
+
+        const blankY = Array.from({ length: browserData.times.length }, () => null);
+        const ticktext = [];
+
+        for (let ii = 0; ii < nChannels; ii++) {
+            const chIdx = channelStart + ii;
+            const trace = outFig.data[ii] || { line: {} };
+
+            if (chIdx < chNames.length) {
+                const chName = chNames[chIdx];
+                const y = allData[chIdx].map((v) => v + ii);
+                const color = bads.has(chName) ? "red" : "black";
+
+                trace.y = y;
+                trace.name = chName;
+                trace.line.color = color;
+                trace.hovertemplate =
+                    `<b>Channel:</b> ${chName}<br>` +
+                    "<b>Time:</b> %{x:.2f} s<br>" +
+                    "<b>Amplitude:</b> %{text:.7f} V<br>" +
+                    "<extra></extra>";
+                ticktext.push(chName);
+            } else {
+                trace.y = blankY;
+                trace.name = "";
+                trace.line.color = "black";
+                trace.hovertemplate =
+                    "<b>Channel:</b><br>" +
+                    "<b>Time:</b> %{x:.2f} s<br>" +
+                    "<b>Amplitude:</b> %{text:.7f} V<br>" +
+                    "<extra></extra>";
+                ticktext.push("");
+            }
+
+            outFig.data[ii] = trace;
+        }
+
+        outFig.layout.yaxis.ticktext = ticktext;
+        return outFig;
+    }
+    """,
     Output("browser", "figure"),
     Input("channel-slider", "value"),
+    State("browser", "figure"),
+    State("browser-data", "data"),
 )
-def update_channels(slider_val):
-    """
-    Patch only the fields that actually change when channel scrolling:
-    - trace y arrays
-    - trace names
-    - trace colors
-    - y-axis tick labels
-    """
-    ch_names, y_arrays, line_colors = _channel_window(slider_val, N_CHANNELS)
-
-    patch = Patch()
-
-    # Update only the changing trace fields.
-    for ii in range(N_CHANNELS):
-        if ii < len(ch_names):
-            ch_name = ch_names[ii]
-            y = y_arrays[ii]
-            color = line_colors[ii]
-        else:
-            ch_name = ""
-            y = np.full(TIMES.shape, np.nan)
-            color = "black"
-
-        patch["data"][ii]["y"] = y
-        patch["data"][ii]["name"] = ch_name
-        patch["data"][ii]["line"]["color"] = color
-        patch["data"][ii]["hovertemplate"] = (
-            f"<b>Channel:</b> {ch_name}<br>"
-            "<b>Time:</b> %{x:.2f} s<br>"
-            # "<b>Amplitude:</b> %{text:.2f} μV<br>"
-            "<extra></extra>"
-        )
-
-    # Update y-axis labels only.
-    ticktext = ch_names + [""] * (N_CHANNELS - len(ch_names))
-    patch["layout"]["yaxis"]["ticktext"] = ticktext
-
-    return patch
 
 
 if __name__ == "__main__":
