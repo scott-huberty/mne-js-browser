@@ -1,0 +1,31 @@
+[project]
+name = "mne-js-browser"
+version = "0.1.0"
+description = "An EEG timeseries web friendly browser."
+readme = "README.md"
+authors = [
+    { name = "Scott Huberty", email = "seh33@uw.edu" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "dash>=4.1.0",
+    "mne>=1.11.0",
+    "numpy>=2.4.3",
+    "plotly>=6.3.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+test = [
+    "pytest>=9.0.2",
+]
+doc = [
+    "shibuya>=2026.1.9",
+    "sphinx>=9.0.4",
+]
+
+[tool.ty.environment]
+python = ".venv"
