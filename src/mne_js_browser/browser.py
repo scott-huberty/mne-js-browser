@@ -56,6 +56,7 @@ class RawBrowser:
         picks="eeg",
         n_channels: int = DEFAULT_N_CHANNELS,
         x_range: tuple[float, float] = DEFAULT_X_RANGE,
+        show=True,
         **dash_kwargs,
     ):
         self.app = create_browser_app(
@@ -65,8 +66,11 @@ class RawBrowser:
             x_range=x_range,
             **dash_kwargs,
         )
+        if show:
+            self.show()
 
-    def run(self, *args, **kwargs):
+
+    def show(self, *args, **kwargs):
         """Proxy to ``dash.Dash.run``."""
         return self.app.run(*args, **kwargs)
 

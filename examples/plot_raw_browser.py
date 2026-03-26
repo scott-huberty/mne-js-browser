@@ -2,7 +2,7 @@
 
 import mne
 
-from mne_js_browser import create_browser_app
+from mne_js_browser import RawBrowser
 
 
 def main():
@@ -19,8 +19,7 @@ def main():
         )
     )
 
-    app = create_browser_app(raw, picks="eeg", n_channels=20)
-    app.run()
+    RawBrowser(raw)
 
 
 if __name__ == "__main__":
