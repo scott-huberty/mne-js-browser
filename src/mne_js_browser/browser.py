@@ -1,347 +1,77 @@
-import numpy as np
-import mne
-import plotly.graph_objects as go
+"""Public orchestration layer for building and running the browser app."""
 
-import dash
-from dash import dcc, html, Input, Output, State
+from __future__ import annotations
 
+from pathlib import Path
 
-data_path = mne.datasets.sample.data_path()
-raw_fname = data_path / "MEG" / "sample" / "sample_audvis_filt-0-40_raw.fif"
-assert raw_fname.exists()
+from dash import Dash
 
-raw = mne.io.Raw(raw_fname, preload=True).resample(100)
-raw.info["bads"] += ["EEG 005"]
-annots = mne.Annotations(
-    onset=[0, 14],
-    duration=[1, 1],
-    description=["BAD_blink", "BAD_blink"],
-)
-raw.set_annotations(annots)
-
-picks = mne.pick_types(raw.info, eeg=True, meg=False, exclude=[])
-
-# -----------------------------------------------------------------------------
-# Constants / precomputed data
-# -----------------------------------------------------------------------------
-N_CHANNELS = 20
-FULL_TMIN = float(raw.times[0])
-FULL_TMAX = float(raw.times[-1])
-TIMES = raw.times.copy()
-
-# Pre-extract all EEG data once and send to browser for client-side channel updates.
-# Shape: (n_eeg_channels, n_times)
-ALL_DATA = raw.get_data(picks=picks)
-ALL_DATA_SCALED = ALL_DATA * 1e4  # visual scaling for stacked display
-
-BADS = set(raw.info["bads"])
-ALL_CH_NAMES = [raw.info["ch_names"][p] for p in picks]
-MAX_SLIDER_VALUE = max(0, len(picks) - N_CHANNELS)
-
-CLIENT_DATA = {
-    "times": TIMES.tolist(),
-    "all_data_scaled": ALL_DATA_SCALED.tolist(),
-    "ch_names": ALL_CH_NAMES,
-    "bads": sorted(BADS),
-    "n_channels": N_CHANNELS,
-}
+from .callbacks import register_callbacks
+from .config import DEFAULT_N_CHANNELS, DEFAULT_X_RANGE
+from .data import prepare_browser_data, to_client_dict
+from .figure import make_base_figure
+from .layout import build_layout
 
 
-def _annotation_overlays():
-    """Build static Plotly shapes/annotations once."""
-    shapes = []
-    annotations = []
+def create_browser_app(
+    raw,
+    *,
+    picks="eeg",
+    n_channels: int = DEFAULT_N_CHANNELS,
+    x_range: tuple[float, float] = DEFAULT_X_RANGE,
+    **dash_kwargs,
+):
+    """Create a configured Dash app for browsing a prepared MNE Raw object."""
+    if n_channels < 1:
+        raise ValueError("n_channels must be >= 1")
 
-    for annot in raw.annotations:
-        start = float(annot["onset"] - raw.first_samp / raw.info["sfreq"])
-        end = start + float(annot["duration"])
+    data = prepare_browser_data(raw, picks=picks, n_channels=n_channels)
+    client_data = to_client_dict(data)
 
-        shapes.append(
-            dict(
-                type="rect",
-                xref="x",
-                yref="paper",
-                x0=start,
-                x1=end,
-                y0=0,
-                y1=1,
-                fillcolor="red",
-                opacity=0.5,
-                layer="below",
-                line_width=0,
-            )
-        )
+    max_slider_value = max(0, len(data.ch_names) - data.n_channels)
+    slider_start = max_slider_value
 
-        # Put labels near the top of the plotting area in paper coords
-        annotations.append(
-            dict(
-                x=(start + end) / 2,
-                y=1.0,
-                yref="paper",
-                xref="x",
-                text=annot["description"],
-                showarrow=False,
-                yshift=10,
-                font=dict(color="black", size=10),
-            )
-        )
+    fig = make_base_figure(data, channel_start=slider_start, x_range=x_range)
 
-    return shapes, annotations
-
-
-STATIC_SHAPES, STATIC_ANNOTATIONS = _annotation_overlays()
-
-
-def _channel_window(channel_start, n_channels=N_CHANNELS):
-    """Return channel names, colors, and stacked y arrays for one window."""
-    ch_slice = slice(channel_start, channel_start + n_channels)
-    ch_names = ALL_CH_NAMES[ch_slice]
-    data = ALL_DATA_SCALED[ch_slice]
-
-    y_arrays = []
-    line_colors = []
-    for ii, ch_name in enumerate(ch_names):
-        y_arrays.append(data[ii] + ii)
-        line_colors.append("red" if ch_name in BADS else "black")
-
-    return ch_names, y_arrays, line_colors
-
-
-def make_base_figure(channel_start=0, n_channels=N_CHANNELS, x_range=(0, 10)):
-    """Create the figure once with static layout and exactly N_CHANNELS traces."""
-    x0, x1 = x_range
-    x0 = max(FULL_TMIN, float(x0))
-    x1 = min(FULL_TMAX, float(x1))
-
-    ch_names, y_arrays, line_colors = _channel_window(channel_start, n_channels)
-
-    traces = []
-    for ii in range(n_channels):
-        if ii < len(ch_names):
-            ch_name = ch_names[ii]
-            y = y_arrays[ii]
-            color = line_colors[ii]
-        else:
-            ch_name = ""
-            y = np.full(TIMES.shape, np.nan)
-            color = "black"
-
-        traces.append(
-            go.Scattergl(
-                x=TIMES,
-                y=y,
-                name=ch_name,
-                mode="lines",
-                text=ALL_DATA[ii],
-                line=dict(color=color, width=1),
-                showlegend=False,
-                hovertemplate=(
-                    f"<b>Channel:</b> {ch_name}<br>"
-                    "<b>Time:</b> %{x:.2f} s<br>"
-                    "<b>Amplitude:</b> %{text:.7f} V<br>"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-    ticks = list(range(n_channels))
-    ticktext = ch_names + [""] * (n_channels - len(ch_names))
-    ymin, ymax = -0.5, n_channels - 0.5
-
-    fig = go.Figure(data=traces)
-    fig.update_layout(
-        showlegend=False,
-        autosize=False,
-        width=900,
-        height=540,
-        margin=dict(l=20, r=20, b=20, t=20),
-        xaxis=dict(
-            title="Time (s)",
-            fixedrange=True,
-            ticks="outside",
-            side="bottom",
-            rangeslider=dict(
-                visible=True,
-                thickness=0.01,
-                bgcolor="LightGrey",
-            ),
-            type="linear",
-            range=[x0, x1],
-            minallowed=FULL_TMIN,
-            maxallowed=FULL_TMAX,
-        ),
-        yaxis=dict(
-            zeroline=False,
-            showgrid=False,
-            range=[ymin, ymax],
-            tickvals=ticks,
-            ticktext=ticktext,
-        ),
-        shapes=STATIC_SHAPES,
-        annotations=STATIC_ANNOTATIONS,
-        # Helps Plotly preserve client-side UI state across updates
-        uirevision="browser",
+    assets_folder = Path(__file__).resolve().parent / "assets"
+    app = Dash(__name__, assets_folder=str(assets_folder), **dash_kwargs)
+    app.layout = build_layout(
+        initial_figure=fig,
+        client_data=client_data,
+        max_slider_value=max_slider_value,
+        slider_start=slider_start,
     )
-    return fig
+
+    register_callbacks(app)
+    return app
 
 
-# -----------------------------------------------------------------------------
-# Dash app
-# -----------------------------------------------------------------------------
-app = dash.Dash(__name__)
+class RawBrowser:
+    """Simple wrapper around a Dash app with browser-centric defaults."""
 
-app.layout = html.Div(
-    style={"display": "flex", "alignItems": "flex-start", "columnGap": "8px"},
-    children=[
-        dcc.Store(id="browser-data", data=CLIENT_DATA),
-        dcc.Store(id="bad-channels", data=CLIENT_DATA["bads"]),
-        html.Div(
-            children=[
-                dcc.Slider(
-                    id="channel-slider",
-                    min=0,
-                    max=MAX_SLIDER_VALUE,
-                    step=1,
-                    value=MAX_SLIDER_VALUE,
-                    marks=None,
-                    vertical=True,
-                    verticalHeight=300,
-                    included=False,
-                    updatemode="drag",
-                )
-            ],
-            style={"width": "2%", "paddingTop": "10%", "flexShrink": 0},
-        ),
-        html.Div(
-            children=[
-                dcc.Graph(
-                    id="browser",
-                    figure=make_base_figure(channel_start=MAX_SLIDER_VALUE),
-                )
-            ],
-            style={"flex": "1 1 auto", "minWidth": 0},
-        ),
-    ],
-)
+    def __init__(
+        self,
+        raw,
+        *,
+        picks="eeg",
+        n_channels: int = DEFAULT_N_CHANNELS,
+        x_range: tuple[float, float] = DEFAULT_X_RANGE,
+        **dash_kwargs,
+    ):
+        self.app = create_browser_app(
+            raw,
+            picks=picks,
+            n_channels=n_channels,
+            x_range=x_range,
+            **dash_kwargs,
+        )
+
+    def run(self, *args, **kwargs):
+        """Proxy to ``dash.Dash.run``."""
+        return self.app.run(*args, **kwargs)
 
 
-app.clientside_callback(
-    """
-    function(clickData, fig, badChannels) {
-        const noUpdate = window.dash_clientside.no_update;
-        if (!clickData || !clickData.points || clickData.points.length === 0 || !fig || !fig.data) {
-            return noUpdate;
-        }
-
-        const point = clickData.points[0];
-        const curveNumber = point.curveNumber;
-        if (curveNumber === undefined || curveNumber === null) {
-            return noUpdate;
-        }
-
-        const trace = fig.data[curveNumber];
-        if (!trace || !trace.name) {
-            return noUpdate;
-        }
-
-        const next = Array.isArray(badChannels) ? [...badChannels] : [];
-        const idx = next.indexOf(trace.name);
-        if (idx >= 0) {
-            next.splice(idx, 1);
-        } else {
-            next.push(trace.name);
-        }
-        return next;
-    }
-    """,
-    Output("bad-channels", "data"),
-    Input("browser", "clickData"),
-    State("browser", "figure"),
-    State("bad-channels", "data"),
-    prevent_initial_call=True,
-)
-
-
-app.clientside_callback(
-    """
-    function(sliderVal, badChannels, fig, browserData) {
-        if (!fig || !browserData) {
-            return fig;
-        }
-
-        const nChannels = browserData.n_channels;
-        const allData = browserData.all_data_scaled;
-        const chNames = browserData.ch_names;
-        const bads = new Set(
-            Array.isArray(badChannels) ? badChannels : (browserData.bads || [])
-        );
-
-        const maxStart = Math.max(0, chNames.length - nChannels);
-        const channelStart = Math.max(0, Math.min(sliderVal || 0, maxStart));
-
-        const outFig = {
-            ...fig,
-            data: (fig.data || []).map((trace) => ({
-                ...trace,
-                line: { ...(trace.line || {}) },
-            })),
-            layout: {
-                ...fig.layout,
-                yaxis: { ...(fig.layout?.yaxis || {}) },
-            },
-        };
-
-        const blankY = Array.from({ length: browserData.times.length }, () => null);
-        const ticktext = [];
-
-        for (let ii = 0; ii < nChannels; ii++) {
-            const chIdx = channelStart + ii;
-            const trace = outFig.data[ii] || { line: {} };
-
-            if (chIdx < chNames.length) {
-                const chName = chNames[chIdx];
-                const y = allData[chIdx].map((v) => v + ii);
-                const color = bads.has(chName) ? "red" : "black";
-
-                trace.y = y;
-                trace.name = chName;
-                trace.line.color = color;
-                trace.hovertemplate =
-                    `<b>Channel:</b> ${chName}<br>` +
-                    "<b>Time:</b> %{x:.2f} s<br>" +
-                    "<b>Amplitude:</b> %{text:.7f} V<br>" +
-                    "<extra></extra>";
-                ticktext.push(chName);
-            } else {
-                trace.y = blankY;
-                trace.name = "";
-                trace.line.color = "black";
-                trace.hovertemplate =
-                    "<b>Channel:</b><br>" +
-                    "<b>Time:</b> %{x:.2f} s<br>" +
-                    "<b>Amplitude:</b> %{text:.7f} V<br>" +
-                    "<extra></extra>";
-                ticktext.push("");
-            }
-
-            outFig.data[ii] = trace;
-        }
-
-        outFig.layout.yaxis.ticktext = ticktext;
-        return outFig;
-    }
-    """,
-    Output("browser", "figure"),
-    Input("channel-slider", "value"),
-    Input("bad-channels", "data"),
-    State("browser", "figure"),
-    State("browser-data", "data"),
-)
-
-
-if __name__ == "__main__":
-    import webbrowser
-    from threading import Timer
-
-    Timer(1, lambda: webbrowser.open("http://127.0.0.1:8050/")).start()
-    app.run()
+def main():
+    raise RuntimeError(
+        "No CLI demo is bundled in the package. Use examples/plot_raw_browser.py instead."
+    )
